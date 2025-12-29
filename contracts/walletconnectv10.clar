@@ -1,59 +1,110 @@
-;; --------------------------------------------------
-;; STACKS COMPATIBLE MARKETPLACE (v2)
-;; --------------------------------------------------
+;; VIP BAZAAR - Unique NFT Marketplace
+;; Inspired by the Tiny Market pattern but optimized for v11
 
-;; 1. Definir variables de datos
-(define-data-var contract-owner principal tx-sender)
-(define-data-var service-count uint u0)
+;; Traits definitions
+(use-trait nft-trait 'SP2PABAF9FTAJYNFZH93XENAJ8FVY99RRM50D2JG9.nft-trait.nft-trait)
+(use-trait ft-trait 'SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE.sip-010-trait-ft-standard.sip-010-trait)
 
-;; 2. Definir mapas (Estructura optimizada para Stacks)
-(define-map services 
+;; Constants
+(define-constant BAZAAR-ADMIN tx-sender)
+(define-constant ERR-NOT-AUTHORIZED (err u3001))
+(define-constant ERR-INVALID-PRICE (err u3002))
+(define-constant ERR-LISTING-NOT-FOUND (err u3003))
+(define-constant ERR-EXPIRED (err u3004))
+
+;; Data Structures
+(define-map active-offers
     uint 
-    { name: (string-ascii 50), price: uint, active: bool }
+    {
+        seller: principal,
+        buyer-only: (optional principal),
+        token-id: uint,
+        nft-contract: principal,
+        deadline: uint,
+        cost: uint,
+        payment-token: (optional principal)
+    }
 )
 
-(define-map purchases 
-    { user: principal, service-id: uint } 
-    bool
+(define-data-var offer-nonce uint u0)
+(define-map authorized-contracts principal bool)
+
+;; --- Authorization ---
+
+(define-read-only (is-authorized (contract principal))
+    (default-to true (map-get? authorized-contracts contract))
 )
 
-;; 3. Funciones Administrativas (Owner Only)
-(define-public (add-service (name (string-ascii 50)) (price uint))
-    (let ((new-id (+ (var-get service-count) u1)))
-        ;; Solo el owner puede añadir servicios
-        (asserts! (is-eq tx-sender (var-get contract-owner)) (err u401))
-        
-        (map-set services new-id { name: name, price: price, active: true })
-        (var-set service-count new-id)
-        (ok new-id)
+(define-public (toggle-contract (contract principal) (status bool))
+    (begin
+        (asserts! (is-eq tx-sender BAZAAR-ADMIN) ERR-NOT-AUTHORIZED)
+        (ok (map-set authorized-contracts contract status))
     )
 )
 
-;; 4. Funciones Públicas (Open for AppKit)
-(define-public (buy-service (id uint))
+;; --- Internal Helpers ---
+
+(define-private (move-nft (contract <nft-trait>) (id uint) (from principal) (to principal))
+    (contract-call? contract transfer id from to)
+)
+
+(define-private (move-ft (contract <ft-trait>) (amount uint) (from principal) (to principal))
+    (contract-call? contract transfer amount from to none)
+)
+
+;; --- Core Functions ---
+
+;; List a new VIP Item
+(define-public (create-offer
+    (nft-contract <nft-trait>)
+    (details {
+        buyer-only: (optional principal),
+        token-id: uint,
+        deadline: uint,
+        cost: uint,
+        payment-token: (optional principal)
+    })
+)
+    (let ((offer-id (var-get offer-nonce)))
+        (asserts! (is-authorized (contract-of nft-contract)) ERR-NOT-AUTHORIZED)
+        (asserts! (> (get cost details) u0) ERR-INVALID-PRICE)
+        
+        ;; Lock NFT in the contract (Escrow)
+        (try! (move-nft nft-contract (get token-id details) tx-sender (as-contract tx-sender)))
+        
+        (map-set active-offers offer-id
+            (merge {
+                seller: tx-sender,
+                nft-contract: (contract-of nft-contract)
+            } details)
+        )
+        
+        (var-set offer-nonce (+ offer-id u1))
+        (ok offer-id)
+    )
+)
+
+;; Purchase with STX
+(define-public (fill-offer-stx (offer-id uint) (nft-contract <nft-trait>))
     (let (
-        ;; Desempaquetamos el servicio o devolvemos error 404
-        (service (unwrap! (map-get? services id) (err u404)))
-        (price (get price service))
-        (current-owner (var-get contract-owner))
+        (offer (unwrap! (map-get? active-offers offer-id) ERR-LISTING-NOT-FOUND))
+        (buyer tx-sender)
     )
-        ;; Validar que esté activo
-        (asserts! (get active service) (err u405))
+        ;; Validations
+        (asserts! (not (is-eq (get seller offer) buyer)) (err u3005))
+        (asserts! (< burn-block-height (get deadline offer)) ERR-EXPIRED)
+        (asserts! (is-eq (get nft-contract offer) (contract-of nft-contract)) (err u3006))
         
-        ;; Transferencia de STX (El núcleo de la transacción)
-        (try! (stx-transfer? price tx-sender current-owner))
+        ;; Payments & Transfer
+        (try! (as-contract (move-nft nft-contract (get token-id offer) tx-sender buyer)))
+        (try! (stx-transfer? (get cost offer) buyer (get seller offer)))
         
-        ;; Registrar la compra en el mapa
-        (map-set purchases { user: tx-sender, service-id: id } true)
-        (ok true)
+        (map-delete active-offers offer-id)
+        (ok offer-id)
     )
 )
 
-;; 5. Funciones de Lectura (Read-only)
-(define-read-only (get-service-info (id uint))
-    (ok (map-get? services id))
-)
-
-(define-read-only (check-purchase (user principal) (id uint))
-    (ok (default-to false (map-get? purchases { user: user, service-id: id })))
+;; --- Read Only ---
+(define-read-only (get-offer-data (id uint))
+    (map-get? active-offers id)
 )

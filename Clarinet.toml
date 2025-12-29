@@ -1,11 +1,11 @@
 [project]
-name = "walletconnectv10"
+name = "walletconnectv10f"
 authors = []
 description = ""
 telemetry = true
 requirements = []
 
-[contracts.walletconnectv10]
+[contracts.walletconnectv10f]
 path = "contracts/walletconnectv10.clar"
 clarity_version = 2
 
